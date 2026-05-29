@@ -17,9 +17,12 @@ from ag_ui.core import (
     ReasoningMessageEndEvent,
     ReasoningMessageStartEvent,
     ReasoningStartEvent,
+    RunErrorEvent,
     RunFinishedEvent,
     StateDeltaEvent,
     StateSnapshotEvent,
+    StepFinishedEvent,
+    StepStartedEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -43,8 +46,27 @@ from agno.run.team import ReasoningStartedEvent as TeamReasoningStartedEvent
 from agno.run.team import ReasoningStepEvent as TeamReasoningStepEvent
 from agno.run.team import RunContentEvent as TeamRunContentEvent
 from agno.run.team import TeamRunEvent, TeamRunOutputEvent
-from agno.utils.log import log_warning
+from agno.run.workflow import (
+    WorkflowCancelledEvent,
+    WorkflowCompletedEvent,
+    WorkflowErrorEvent,
+    WorkflowRunEvent,
+    WorkflowRunOutputEvent,
+)
+from agno.utils.log import log_debug, log_error, log_warning
 from agno.utils.message import get_text_from_message
+
+# Events to suppress when streaming a workflow. The workflow emits its own
+# consolidated content via WorkflowCompletedEvent; inner agent/team text events
+# would duplicate that content in the AG-UI client.
+_SUPPRESSED_IN_WORKFLOW: frozenset = frozenset(
+    {
+        RunEvent.run_content.value,
+        RunEvent.run_intermediate_content.value,
+        TeamRunEvent.run_content.value,
+        TeamRunEvent.run_intermediate_content.value,
+    }
+)
 
 
 def validate_agui_state(state: Any, thread_id: str) -> Optional[Dict[str, Any]]:
@@ -58,22 +80,22 @@ def validate_agui_state(state: Any, thread_id: str) -> Optional[Dict[str, Any]]:
     if isinstance(state, BaseModel):
         try:
             return state.model_dump()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_warning(f"AGUI state.model_dump() failed (thread {thread_id}): {type(exc).__name__}: {exc}")
 
     if is_dataclass(state):
         try:
             return asdict(state)  # type: ignore
-        except Exception:
-            pass
+        except Exception as exc:
+            log_warning(f"AGUI asdict(state) failed (thread {thread_id}): {type(exc).__name__}: {exc}")
 
     if hasattr(state, "to_dict") and callable(getattr(state, "to_dict")):
         try:
             result = state.to_dict()  # type: ignore
             if isinstance(result, dict):
                 return result
-        except Exception:
-            pass
+        except Exception as exc:
+            log_warning(f"AGUI state.to_dict() failed (thread {thread_id}): {type(exc).__name__}: {exc}")
 
     log_warning(f"AGUI state must be a dict, got {type(state).__name__}. State will be ignored. Thread: {thread_id}")
     return None
@@ -93,6 +115,10 @@ class EventBuffer:
     _last_snapshot: Optional[Dict[str, Any]] = field(
         default=None, repr=False
     )  # Snapshot of last state for delta computation
+    workflow_agent_active: bool = False  # True between workflow_agent_started and workflow_agent_completed
+    workflow_reasoning_id: Optional[str] = (
+        None  # Active workflow-progress reasoning message (rendered as "Thinking…" card)
+    )
 
     def __init__(self):
         self.active_tool_call_ids = set()
@@ -103,6 +129,8 @@ class EventBuffer:
         self.reasoning_message_id = None
         self.reasoning_step_count = 0
         self._last_snapshot = None
+        self.workflow_agent_active = False
+        self.workflow_reasoning_id = None
 
     def start_tool_call(self, tool_call_id: str) -> None:
         """Start a new tool call."""
@@ -182,6 +210,15 @@ class EventBuffer:
         """End the active reasoning session."""
         self.reasoning_message_id = None
         self.reasoning_step_count = 0
+
+    def start_workflow_reasoning(self) -> str:
+        """Start the workflow-progress reasoning message and return its ID."""
+        self.workflow_reasoning_id = str(uuid.uuid4())
+        return self.workflow_reasoning_id
+
+    def end_workflow_reasoning(self) -> None:
+        """End the workflow-progress reasoning message."""
+        self.workflow_reasoning_id = None
 
 
 def extract_agui_user_input(messages: List[AGUIMessage]) -> str:
@@ -285,11 +322,12 @@ def _format_reasoning_step_delta(step: Optional[ReasoningStep], step_number: int
 
 
 def _create_events_from_chunk(
-    chunk: Union[RunOutputEvent, TeamRunOutputEvent],
+    chunk: Union[RunOutputEvent, TeamRunOutputEvent, WorkflowRunOutputEvent],
     message_id: str,
     message_started: bool,
     event_buffer: EventBuffer,
     run_state: Optional[Dict[str, Any]] = None,
+    is_workflow: bool = False,
 ) -> Tuple[List[BaseEvent], bool, str]:
     """
     Process a single chunk and return events to emit + updated message_started state.
@@ -300,12 +338,25 @@ def _create_events_from_chunk(
         message_started: Whether a message is currently active
         event_buffer: Event buffer for tracking tool call state (includes reasoning session state)
         run_state: Mutable dict reference to the agent's session state (for delta tracking)
+        is_workflow: When True, drop inner agent/team content events to avoid
+            duplication with WorkflowCompletedEvent.content emitted at completion.
 
     Returns:
         Tuple of (events_to_emit, new_message_started_state, message_id)
     """
     events_to_emit: List[BaseEvent] = []
     is_content_event = False
+
+    # When streaming a workflow, suppress inner agent/team content events.
+    # The workflow's consolidated content is emitted via WorkflowCompletedEvent
+    # in _create_completion_events; inner run_content would duplicate it.
+    # EXCEPT during workflow-agent direct-answer (between workflow_agent_started
+    # and workflow_agent_completed) — that content IS the final answer and
+    # WorkflowCompletedEvent skips emission via agent_direct_response. Without
+    # this guard the user sees a blank UI on direct-answer workflows.
+    if is_workflow and chunk.event in _SUPPRESSED_IN_WORKFLOW and not event_buffer.workflow_agent_active:
+        log_debug(f"AGUI: suppressing inner event {chunk.event!r} in workflow stream")
+        return events_to_emit, message_started, message_id
 
     # Extract content if the contextual event is a content event
     if chunk.event == RunEvent.run_content:
@@ -398,7 +449,9 @@ def _create_events_from_chunk(
             args_event = ToolCallArgsEvent(
                 type=EventType.TOOL_CALL_ARGS,
                 tool_call_id=tool_call.tool_call_id,  # type: ignore
-                delta=json.dumps(tool_call.tool_args),
+                # default=str handles non-JSON-serializable types (datetime, UUID, bytes, etc.)
+                # that tool implementations commonly produce.
+                delta=json.dumps(tool_call.tool_args, default=str),
             )
             events_to_emit.append(args_event)  # type: ignore
 
@@ -491,6 +544,204 @@ def _create_events_from_chunk(
             events_to_emit.append(ReasoningEndEvent(type=EventType.REASONING_END, message_id=reasoning_id))
             event_buffer.end_reasoning()
 
+    # Handle workflow-level events
+    elif chunk.event == WorkflowRunEvent.workflow_started:
+        workflow_name = getattr(chunk, "workflow_name", None) or "workflow"
+        events_to_emit.append(
+            CustomEvent(
+                name="WorkflowStarted",
+                value={"workflow_name": workflow_name, "message": f"Starting workflow: {workflow_name}"},
+            )
+        )
+        # Open a reasoning message that will render as the "Thinking…" card in
+        # CopilotKit-based clients (Dojo). Step lifecycle deltas accumulate into
+        # this single card and the card auto-collapses to "Thought for N seconds"
+        # when we close it on workflow completion.
+        if event_buffer.workflow_reasoning_id is None:
+            wf_reasoning_id = event_buffer.start_workflow_reasoning()
+            events_to_emit.append(ReasoningStartEvent(type=EventType.REASONING_START, message_id=wf_reasoning_id))
+            events_to_emit.append(
+                ReasoningMessageStartEvent(
+                    type=EventType.REASONING_MESSAGE_START, message_id=wf_reasoning_id, role="reasoning"
+                )
+            )
+            # Emit the workflow name as the first delta inside the Thinking card.
+            # Surfaces the workflow identity to the user without polluting the
+            # final answer; renders as the first line of "Thought for N seconds".
+            events_to_emit.append(
+                ReasoningMessageContentEvent(
+                    type=EventType.REASONING_MESSAGE_CONTENT,
+                    message_id=wf_reasoning_id,
+                    delta=f"Workflow: {workflow_name}\n\n",
+                )
+            )
+
+    # workflow_completed, workflow_error, and workflow_cancelled are terminal
+    # events — routed through the completion gate in
+    # stream_agno_response_as_agui_events to _create_completion_events, which
+    # emits their content / error / cancel events plus run termination. Do not
+    # handle them here.
+
+    elif chunk.event == WorkflowRunEvent.step_error:
+        # step_error is a non-terminal event — the workflow may continue or
+        # recover. Emit as CustomEvent + StepFinishedEvent (NOT RunErrorEvent
+        # which is AG-UI spec terminal: no events may follow RunErrorEvent).
+        error_message = getattr(chunk, "error", None) or "Step error occurred"
+        step_name = getattr(chunk, "step_name", None) or "unknown_step"
+        log_error(f"Step error in {step_name}: {error_message}")
+        events_to_emit.append(CustomEvent(name="StepError", value={"step_name": step_name, "error": error_message}))
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=step_name))
+
+    # Handle workflow step events.
+    # We deliberately emit a single past-tense entry per step at completion time
+    # (instead of "Running step…" then "Finished step…") so the collapsed
+    # "Thought for N seconds" card reads naturally after the run. AG-UI's
+    # REASONING_MESSAGE_CONTENT is append-only — we can't rewrite an earlier
+    # "Running" line into "Ran" once a step finishes, so the past-tense-only
+    # approach avoids the awkward "Running step: X" in a completed transcript.
+    elif chunk.event == WorkflowRunEvent.step_started:
+        step_name = getattr(chunk, "step_name", None) or "workflow_step"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=step_name))
+
+    elif chunk.event == WorkflowRunEvent.step_completed:
+        step_name = getattr(chunk, "step_name", None) or "workflow_step"
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=step_name))
+        if event_buffer.workflow_reasoning_id is not None:
+            events_to_emit.append(
+                ReasoningMessageContentEvent(
+                    type=EventType.REASONING_MESSAGE_CONTENT,
+                    message_id=event_buffer.workflow_reasoning_id,
+                    delta=f"Ran step: {step_name}\n\n",
+                )
+            )
+
+    # Handle workflow agent events.
+    # WorkflowAgentStartedEvent / WorkflowAgentCompletedEvent do NOT carry an
+    # agent_name field — the producer (workflow/workflow.py) populates only
+    # workflow_name / workflow_id / session_id (and content for completed).
+    # We label the step with workflow_name; "workflow_agent" is a defensive
+    # fallback. WorkflowAgentCompletedEvent.content is intentionally NOT
+    # forwarded: the agent's text was already streamed via inner
+    # RunContentEvent (which is NOT suppressed during this window — see the
+    # workflow_agent_active guard in the suppression check above).
+    elif chunk.event == WorkflowRunEvent.workflow_agent_started:
+        event_buffer.workflow_agent_active = True
+        agent_label = getattr(chunk, "workflow_name", None) or "workflow_agent"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=f"agent:{agent_label}"))
+
+    elif chunk.event == WorkflowRunEvent.workflow_agent_completed:
+        event_buffer.workflow_agent_active = False
+        agent_label = getattr(chunk, "workflow_name", None) or "workflow_agent"
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=f"agent:{agent_label}"))
+
+    # Handle conditional flow events
+    elif chunk.event == WorkflowRunEvent.condition_execution_started:
+        step_name = getattr(chunk, "step_name", None) or "condition"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=f"Condition: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.condition_execution_completed:
+        step_name = getattr(chunk, "step_name", None) or "condition"
+        events_to_emit.append(
+            CustomEvent(
+                name="ConditionExecutionCompleted",
+                value={
+                    "step_name": step_name,
+                    "condition_result": getattr(chunk, "condition_result", None),
+                    "branch": getattr(chunk, "branch", None),
+                },
+            )
+        )
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=f"Condition: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.condition_paused:
+        step_name = getattr(chunk, "step_name", None) or "condition"
+        events_to_emit.append(
+            CustomEvent(
+                name="ConditionPaused",
+                value={"step_name": step_name, "message": f"Condition paused awaiting input: {step_name}"},
+            )
+        )
+
+    # Handle router events
+    elif chunk.event == WorkflowRunEvent.router_execution_started:
+        step_name = getattr(chunk, "step_name", None) or "router"
+        events_to_emit.append(
+            CustomEvent(
+                name="RouterExecutionStarted",
+                value={"step_name": step_name, "selected_steps": getattr(chunk, "selected_steps", None) or []},
+            )
+        )
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=f"Router: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.router_execution_completed:
+        step_name = getattr(chunk, "step_name", None) or "router"
+        # executed_steps from producer is Optional[int] (count), not a list.
+        events_to_emit.append(
+            CustomEvent(
+                name="RouterExecutionCompleted",
+                value={"step_name": step_name, "executed_steps": getattr(chunk, "executed_steps", None)},
+            )
+        )
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=f"Router: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.router_paused:
+        step_name = getattr(chunk, "step_name", None) or "router"
+        events_to_emit.append(
+            CustomEvent(
+                name="RouterPaused",
+                value={
+                    "step_name": step_name,
+                    "available_choices": getattr(chunk, "available_choices", None) or [],
+                    "message": getattr(chunk, "user_input_message", None) or f"Router paused: {step_name}",
+                },
+            )
+        )
+
+    # Handle loop events
+    elif chunk.event == WorkflowRunEvent.loop_execution_started:
+        step_name = getattr(chunk, "step_name", None) or "loop"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=f"Loop: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.loop_iteration_started:
+        iteration = getattr(chunk, "iteration", None) or 0
+        max_iterations = getattr(chunk, "max_iterations", None)
+        label = f"Loop iter {iteration}/{max_iterations}" if max_iterations else f"Loop iter {iteration}"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=label))
+
+    elif chunk.event == WorkflowRunEvent.loop_iteration_completed:
+        iteration = getattr(chunk, "iteration", None) or 0
+        max_iterations = getattr(chunk, "max_iterations", None)
+        label = f"Loop iter {iteration}/{max_iterations}" if max_iterations else f"Loop iter {iteration}"
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=label))
+
+    elif chunk.event == WorkflowRunEvent.loop_execution_completed:
+        step_name = getattr(chunk, "step_name", None) or "loop"
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=f"Loop: {step_name}"))
+
+    # Handle parallel events
+    elif chunk.event == WorkflowRunEvent.parallel_execution_started:
+        step_name = getattr(chunk, "step_name", None) or "parallel"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=f"Parallel: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.parallel_execution_completed:
+        step_name = getattr(chunk, "step_name", None) or "parallel"
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=f"Parallel: {step_name}"))
+
+    # Handle steps group events
+    elif chunk.event == WorkflowRunEvent.steps_execution_started:
+        step_name = getattr(chunk, "step_name", None) or "steps"
+        events_to_emit.append(StepStartedEvent(type=EventType.STEP_STARTED, step_name=f"Steps: {step_name}"))
+
+    elif chunk.event == WorkflowRunEvent.steps_execution_completed:
+        step_name = getattr(chunk, "step_name", None) or "steps"
+        events_to_emit.append(StepFinishedEvent(type=EventType.STEP_FINISHED, step_name=f"Steps: {step_name}"))
+
+    # Log unmapped workflow events (HITL pause/continue, step_output, etc.) for
+    # observability. Falls through silently in other interfaces — debugging
+    # "where did my event go?" without this is hard. Does not emit AG-UI events.
+    elif chunk.event in {e.value for e in WorkflowRunEvent}:
+        log_debug(f"AGUI: workflow event {chunk.event!r} has no explicit handler (intentional or deferred)")
+
     # Handle custom events
     elif chunk.event in (RunEvent.custom_event, TeamRunEvent.custom_event):
         # Use the name of the event class if available, otherwise default to the CustomEvent
@@ -499,10 +750,13 @@ def _create_events_from_chunk(
         except Exception:
             custom_event_name = chunk.event
 
-        # Use the complete Agno event as value if parsing it works, else the event content field
+        # Use the complete Agno event as value if parsing it works, else fall back
+        # to the content field and surface the to_dict failure so genuine
+        # serialization bugs aren't silently masked.
         try:
             custom_event_value = chunk.to_dict()
-        except Exception:
+        except Exception as exc:
+            log_warning(f"CustomEvent {custom_event_name}.to_dict() failed; falling back to .content: {exc}")
             custom_event_value = chunk.content  # type: ignore
 
         custom_event = CustomEvent(name=custom_event_name, value=custom_event_value)
@@ -520,7 +774,7 @@ def _create_events_from_chunk(
 
 
 def _create_completion_events(
-    chunk: Union[RunOutputEvent, TeamRunOutputEvent],
+    chunk: Union[RunOutputEvent, TeamRunOutputEvent, WorkflowRunOutputEvent],
     event_buffer: EventBuffer,
     message_started: bool,
     message_id: str,
@@ -554,6 +808,87 @@ def _create_completion_events(
     if message_started:
         end_message_event = TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=message_id)
         events_to_emit.append(end_message_event)
+
+    # Workflow ERROR is terminal in AG-UI spec — emit RunErrorEvent and return.
+    # Do NOT also emit RunFinishedEvent (spec: RunErrorEvent is the final event).
+    if isinstance(chunk, WorkflowErrorEvent):
+        error_msg = getattr(chunk, "error", None) or "Workflow error occurred"
+        workflow_name = chunk.workflow_name or "workflow"
+        log_error(f"Workflow error in {workflow_name}: {error_msg}")
+        events_to_emit.append(RunErrorEvent(type=EventType.RUN_ERROR, message=f"Workflow error: {error_msg}"))
+        return events_to_emit
+
+    # Workflow CANCEL is also terminal — emit a CustomEvent marker for client
+    # observability (cancel != error semantically) then RunErrorEvent so the
+    # AG-UI client treats the run as ended. No RunFinishedEvent follows.
+    if isinstance(chunk, WorkflowCancelledEvent):
+        reason = getattr(chunk, "reason", None) or "no reason given"
+        workflow_name = chunk.workflow_name or "workflow"
+        events_to_emit.append(
+            CustomEvent(name="WorkflowCancelled", value={"workflow_name": workflow_name, "reason": reason})
+        )
+        events_to_emit.append(RunErrorEvent(type=EventType.RUN_ERROR, message=f"Workflow cancelled: {reason}"))
+        return events_to_emit
+
+    # Workflow COMPLETED — always emit a CustomEvent("WorkflowCompleted") for
+    # client observability; additionally emit consolidated content as a fresh
+    # TextMessage triplet when content is present (AG-UI requires final text
+    # via TextMessage* events; RunFinishedEvent.result is opaque to clients).
+    # Skip the triplet when agent_direct_response=True (content was already
+    # streamed via inner agent's RunContentEvent — emitting again would
+    # duplicate). Falls through to RunFinishedEvent — completion is soft terminal.
+    if isinstance(chunk, WorkflowCompletedEvent):
+        # Close the workflow-progress reasoning card BEFORE the final TextMessage.
+        # This makes CopilotKit collapse the "Thinking…" card to "Thought for N
+        # seconds" so the final answer renders below as a fresh assistant message.
+        if event_buffer.workflow_reasoning_id is not None:
+            wf_reasoning_id = event_buffer.workflow_reasoning_id
+            events_to_emit.append(
+                ReasoningMessageEndEvent(type=EventType.REASONING_MESSAGE_END, message_id=wf_reasoning_id)
+            )
+            events_to_emit.append(ReasoningEndEvent(type=EventType.REASONING_END, message_id=wf_reasoning_id))
+            event_buffer.end_workflow_reasoning()
+
+        if chunk.content is not None:
+            # Strict isinstance guard: don't trust falsy non-None metadata
+            # (e.g. an int 0 or False would silently coerce to {} via `or`).
+            metadata = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+            agent_direct = bool(metadata.get("agent_direct_response"))
+            if not agent_direct:
+                rendered = get_text_from_message(chunk.content)
+                if not rendered:
+                    log_warning(
+                        f"WorkflowCompletedEvent.content was non-None but rendered to empty string; "
+                        f"workflow_name={chunk.workflow_name!r}, content_type={type(chunk.content).__name__}"
+                    )
+                if rendered:
+                    # Emit the workflow's consolidated content as the final
+                    # assistant message. We intentionally do NOT prepend the
+                    # workflow name as a header — keeping the response clean
+                    # without metadata noise. The reasoning card (rendered as
+                    # "Thought for N seconds") already provides the per-step
+                    # transcript for users who want to see what ran.
+                    wf_message_id = str(uuid.uuid4())
+                    events_to_emit.append(
+                        TextMessageStartEvent(
+                            type=EventType.TEXT_MESSAGE_START, message_id=wf_message_id, role="assistant"
+                        )
+                    )
+                    events_to_emit.append(
+                        TextMessageContentEvent(
+                            type=EventType.TEXT_MESSAGE_CONTENT, message_id=wf_message_id, delta=rendered
+                        )
+                    )
+                    events_to_emit.append(
+                        TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=wf_message_id)
+                    )
+        wf_name = chunk.workflow_name or "workflow"
+        events_to_emit.append(
+            CustomEvent(
+                name="WorkflowCompleted",
+                value={"workflow_name": wf_name, "message": f"Workflow completed: {wf_name}"},
+            )
+        )
 
     # Emit external execution tools
     if isinstance(chunk, RunPausedEvent):
@@ -600,7 +935,8 @@ def _create_completion_events(
                 args_event = ToolCallArgsEvent(
                     type=EventType.TOOL_CALL_ARGS,
                     tool_call_id=tool.tool_call_id,
-                    delta=json.dumps(tool.tool_args),
+                    # default=str handles non-JSON-serializable types.
+                    delta=json.dumps(tool.tool_args, default=str),
                 )
                 events_to_emit.append(args_event)
 
@@ -643,10 +979,11 @@ def _emit_event_logic(event: BaseEvent, event_buffer: EventBuffer) -> List[BaseE
 
 
 def stream_agno_response_as_agui_events(
-    response_stream: Iterator[Union[RunOutputEvent, TeamRunOutputEvent]],
+    response_stream: Iterator[Union[RunOutputEvent, TeamRunOutputEvent, WorkflowRunOutputEvent]],
     thread_id: str,
     run_id: str,
     run_state: Optional[Dict[str, Any]] = None,
+    is_workflow: bool = False,
 ) -> Iterator[BaseEvent]:
     """Map the Agno response stream to AG-UI format, handling event ordering constraints."""
     message_id = ""  # Will be set by EventBuffer when text message starts
@@ -667,6 +1004,9 @@ def stream_agno_response_as_agui_events(
             or chunk.event == TeamRunEvent.run_completed
             or chunk.event == RunEvent.run_paused
             or chunk.event == TeamRunEvent.run_paused
+            or chunk.event == WorkflowRunEvent.workflow_completed
+            or chunk.event == WorkflowRunEvent.workflow_error
+            or chunk.event == WorkflowRunEvent.workflow_cancelled
         ):
             # Store completion chunk but don't process it yet
             completion_chunk = chunk
@@ -674,7 +1014,7 @@ def stream_agno_response_as_agui_events(
         else:
             # Process regular chunk immediately
             events_from_chunk, message_started, message_id = _create_events_from_chunk(
-                chunk, message_id, message_started, event_buffer, run_state=run_state
+                chunk, message_id, message_started, event_buffer, run_state=run_state, is_workflow=is_workflow
             )
 
             for event in events_from_chunk:
@@ -709,10 +1049,11 @@ def stream_agno_response_as_agui_events(
 
 # Async version - thin wrapper
 async def async_stream_agno_response_as_agui_events(
-    response_stream: AsyncIterator[Union[RunOutputEvent, TeamRunOutputEvent]],
+    response_stream: AsyncIterator[Union[RunOutputEvent, TeamRunOutputEvent, WorkflowRunOutputEvent]],
     thread_id: str,
     run_id: str,
     run_state: Optional[Dict[str, Any]] = None,
+    is_workflow: bool = False,
 ) -> AsyncIterator[BaseEvent]:
     """Map the Agno response stream to AG-UI format, handling event ordering constraints."""
     message_id = ""  # Will be set by EventBuffer when text message starts
@@ -733,6 +1074,9 @@ async def async_stream_agno_response_as_agui_events(
             or chunk.event == TeamRunEvent.run_completed
             or chunk.event == RunEvent.run_paused
             or chunk.event == TeamRunEvent.run_paused
+            or chunk.event == WorkflowRunEvent.workflow_completed
+            or chunk.event == WorkflowRunEvent.workflow_error
+            or chunk.event == WorkflowRunEvent.workflow_cancelled
         ):
             # Store completion chunk but don't process it yet
             completion_chunk = chunk
@@ -740,7 +1084,7 @@ async def async_stream_agno_response_as_agui_events(
         else:
             # Process regular chunk immediately
             events_from_chunk, message_started, message_id = _create_events_from_chunk(
-                chunk, message_id, message_started, event_buffer, run_state=run_state
+                chunk, message_id, message_started, event_buffer, run_state=run_state, is_workflow=is_workflow
             )
 
             for event in events_from_chunk:

@@ -101,3 +101,6 @@ CLAUDE_PRIVATE.md
 pyrightconfig.json
 .python-version
 CLAUDE_PRIVATE.md
+
+# Claude Code local memory dirs (user state, never commit)
+.memory/
