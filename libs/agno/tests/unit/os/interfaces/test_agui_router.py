@@ -4,7 +4,7 @@ import pytest
 
 pytest.importorskip("ag_ui", reason="ag_ui not installed")
 
-from agno.os.interfaces.agui.router import run_agent, run_team
+from agno.os.interfaces.agui.router import run_agent, run_team, run_workflow
 
 
 class FakeRunInput:
@@ -36,7 +36,16 @@ class CaptureKwargsAgent:
         yield
 
 
-@pytest.mark.asyncio
+class CaptureKwargsWorkflow:
+    def __init__(self):
+        self.captured_kwargs = {}
+
+    async def arun(self, **kwargs):
+        self.captured_kwargs = kwargs
+        return
+        yield
+
+
 async def test_run_team_passes_stream_events_not_stream_steps():
     fake_team = CaptureKwargsTeam()
     run_input = FakeRunInput()
@@ -50,7 +59,6 @@ async def test_run_team_passes_stream_events_not_stream_steps():
     assert "stream_steps" not in fake_team.captured_kwargs
 
 
-@pytest.mark.asyncio
 async def test_run_agent_passes_stream_events():
     fake_agent = CaptureKwargsAgent()
     run_input = FakeRunInput()
@@ -62,3 +70,16 @@ async def test_run_agent_passes_stream_events():
     assert fake_agent.captured_kwargs.get("stream") is True
     assert fake_agent.captured_kwargs.get("stream_events") is True
     assert "stream_steps" not in fake_agent.captured_kwargs
+
+
+async def test_run_workflow_passes_stream_events():
+    fake_workflow = CaptureKwargsWorkflow()
+    run_input = FakeRunInput()
+
+    events = []
+    async for event in run_workflow(fake_workflow, run_input):
+        events.append(event)
+
+    assert fake_workflow.captured_kwargs.get("stream") is True
+    assert fake_workflow.captured_kwargs.get("stream_events") is True
+    assert "stream_steps" not in fake_workflow.captured_kwargs
