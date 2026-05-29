@@ -75,3 +75,21 @@
 **Description:** Structured Output.
 
 ---
+
+### workflow.py
+
+**Status:** PASS
+
+**Description:** Workflow via AG-UI - Adaptive Workflow (keyword Router) mounted on AGUI interface.
+
+**Test matrix:**
+- Static: format.sh PASS, validate.sh PASS (1 unrelated pre-existing mypy error in redis vectordb)
+- Unit: 43 tests across test_agui_workflow_events.py, test_workflow_interfaces.py, test_agui_router.py - all pass
+- Integration: 43 Router engine tests pass
+- Error paths: workflow_error, workflow_cancel, step_error, None workflow_name/step_name - all covered
+- Regression: agent path, team path, mutual exclusivity check - all unaffected
+- Manual (Dojo): "hi", "hi there", "thanks", "what is photosynthesis" - all routed correctly, Thinking card shows "Workflow: Adaptive Workflow" plus correct step lifecycle, final answer renders
+
+**Result:** All paths verified. Workflow name visible in Thinking card. Keyword Router routes 1-2 word inputs to chat, 3+ word inputs to research+summarize.
+
+---
