@@ -193,6 +193,9 @@ class CasbinAuthorizationProvider(AuthorizationProvider):
             p_obj, p_act = perm[1], perm[2]
             if p_obj is None or p_act is None:
                 continue
+            # Skip explicit deny rows — a denied scope is not "accessible".
+            if len(perm) >= 4 and str(perm[3]).lower() == "deny":
+                continue
             # When a concrete action is requested, only count grants for that exact
             # action or a true Casbin action-wildcard ("*").
             if action is not None and p_act != action and p_act != "*":
