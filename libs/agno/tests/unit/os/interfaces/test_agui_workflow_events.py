@@ -15,11 +15,9 @@ from ag_ui.core import (
     TextMessageContentEvent,
 )
 
-from agno.os.interfaces.agui.utils import (
-    EventBuffer,
-    _create_events_from_chunk,
-    async_stream_agno_response_as_agui_events,
-)
+from agno.os.interfaces.agui.events import create_events_from_chunk
+from agno.os.interfaces.agui.state import EventBuffer
+from agno.os.interfaces.agui.streaming import async_stream_agno_response_as_agui_events
 from agno.run.agent import RunContentEvent, RunEvent
 from agno.run.workflow import (
     WorkflowCancelledEvent,
@@ -30,7 +28,7 @@ from agno.run.workflow import (
 
 
 def _emit(chunk):
-    events, _, _ = _create_events_from_chunk(chunk, message_id="", message_started=False, event_buffer=EventBuffer())
+    events, _, _ = create_events_from_chunk(chunk, message_id="", message_started=False, event_buffer=EventBuffer())
     return events
 
 
@@ -47,14 +45,14 @@ def test_workflow_started_emits_custom_event():
 
 def test_workflow_completed_does_not_emit_through_chunk_handler():
     # workflow_completed is routed through _create_completion_events by the
-    # stream gate, so _create_events_from_chunk is a no-op for it.
+    # stream gate, so create_events_from_chunk is a no-op for it.
     events = _emit(_chunk(WorkflowRunEvent.workflow_completed.value, workflow_name="my_workflow"))
     assert events == []
 
 
 def test_workflow_error_does_not_emit_through_chunk_handler():
     # workflow_error is routed through _create_completion_events by the
-    # stream gate, so _create_events_from_chunk is a no-op for it.
+    # stream gate, so create_events_from_chunk is a no-op for it.
     events = _emit(_chunk(WorkflowRunEvent.workflow_error.value, error="boom", workflow_name="my_workflow"))
     assert events == []
 
