@@ -369,13 +369,12 @@ New to authorization? Read them in this order:
    decides what they can do. Shows a change taking effect instantly.
 2. `managed_roles_sessions.py` — roles protecting real data: who is allowed to
    delete a saved chat session (and who gets stopped before any data is touched).
-3. `managed_roles_api.py` — manage roles over HTTP (admin-only) with an audit log.
-4. `managed_users.py` — the user directory: list users, give roles, and disable
+3. `managed_users.py` — the user directory: list users, give roles, and disable
    someone instantly (blocked on their next request, even with a valid token).
-5. `manage_users_and_roles.py` — runs a real AgentOS server (not a transcript)
-   that serves the `/authz` user + role management API for a frontend/admin UI,
-   with CORS and a seeded admin + users. Prints a ready-to-use admin token.
-6. `idp_workos_auth0.py` — they already have a login service (WorkOS/Auth0): roles
+4. `manage_users_and_roles.py` — runs a real AgentOS server that serves the
+   `/authz` user + role management API (admin-only, with audit) for a frontend/
+   admin UI, with CORS and a seeded admin + users. Prints a ready-to-use admin token.
+5. `idp_workos_auth0.py` — they already have a login service (WorkOS/Auth0): roles
    ride the token, you only enforce, via a ~30-line custom `AuthorizationProvider`.
 
 ### The two ways a company runs this
@@ -386,7 +385,7 @@ and either way we handle the "what are you allowed to do" part:
 | # | Their situation | Who owns "who has which role" | Do we store users? | Cookbook |
 |---|---|---|---|---|
 | 1 | They have a login service; we only enforce | the login service (role on the token) | no | `idp_workos_auth0.py` |
-| 2 | No login service; they want us to manage it | us (define + assign roles, manage over HTTP) | yes | `managed_roles_api.py` (+ `managed_users.py`) |
+| 2 | No login service; they want us to manage it | us (define + assign roles, manage over HTTP) | yes | `manage_users_and_roles.py` (+ `managed_users.py`) |
 
 A mix of the two is possible without a separate cookbook: a custom
 `AuthorizationProvider` that uses the token's role when present and falls back to

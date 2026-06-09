@@ -14,8 +14,8 @@ pip install -e "libs/agno[roles,openai]"
 
 cd cookbook/05_agent_os/rbac
 python idp_workos_auth0.py        # scenario 1: they have WorkOS/Auth0, we just enforce
-python managed_roles_api.py       # scenario 2: no login service, we manage it (+ audit log)
-python managed_users.py           # scenario 2: the user directory + instant disable
+python managed_users.py           # scenario 2: no login service — directory + instant disable
+python manage_users_and_roles.py  # scenario 2: serve the /authz API for a frontend
 ```
 
 No OpenAI key needed — each file signs in fake users, makes real requests, and
@@ -50,41 +50,7 @@ and pinned to the right issuer + audience. nothing about users is stored here.
 ====================================================================================
 ```
 
-## Scenario 2 — no login service; we manage users + roles (and log every change)
-
-```
-================================================================================
-MANAGING ROLES OVER THE WEB (and who's allowed to)
-================================================================================
-  alice = admin (allowed to manage) | bob = normal user | anon = nobody logged in
-
-  first, who can even use the management endpoints?
-  alice (admin) opens the roles admin            -> ALLOWED (200)  admins can
-  bob (normal)  opens the roles admin            -> BLOCKED (403)  normal users can't -> bounced
-  nobody        opens the roles admin            -> BLOCKED (401)  not logged in -> bounced harder
-
-  now watch alice give bob a new power, live:
-  bob tries to RUN an agent (before)             -> BLOCKED (403)  bob can't run yet
-    (alice created a 'runner' role that can run agents)
-    (alice gave bob the 'runner' role)
-  bob tries to RUN an agent (after)              -> ALLOWED (200)  same bob, now allowed
-    (alice took the 'runner' role back)
-  bob tries to RUN an agent (after revoke)       -> BLOCKED (403)  bounced again
-================================================================================
-
-THE RECORD: every change is logged - who did it, what changed, before -> after.
-(this is what a security review wants to see)
-  system role.set_scopes    viewer   [] -> ["agents:read"]
-  system role.set_scopes    admin    [] -> ["agent_os:admin"]
-  system user.assigned      alice    [] -> ["admin"]
-  system user.assigned      bob      [] -> ["viewer"]
-  alice  role.set_scopes    runner   [] -> ["agents:run"]
-  alice  user.assigned      bob      ["viewer"] -> ["viewer", "runner"]
-  alice  user.unassigned    bob      ["viewer", "runner"] -> ["viewer"]
-
-```
-
-## Scenario 2 (cont.) — the user directory + instant disable
+## Scenario 2 — no login service; the user directory + instant disable
 
 ```
 ================================================================================
