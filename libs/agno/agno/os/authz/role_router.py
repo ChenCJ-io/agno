@@ -22,9 +22,12 @@ middleware before these handlers; a valid-but-non-admin caller gets 403.
 
 Endpoints (default prefix ``/authz``):
     GET    /authz/roles                          list roles (paginated)
+    POST   /authz/roles                          create a role (metadata only)
     GET    /authz/roles/{slug}                   a role with its scopes
-    PUT    /authz/roles/{slug}                   set scopes/metadata  {"scopes":[...]}
+    PATCH  /authz/roles/{slug}                   update metadata (name/description)
     DELETE /authz/roles/{slug}                   delete a role
+    PUT    /authz/roles/{slug}/scopes            replace scopes
+    PATCH  /authz/roles/{slug}/scopes            diff scopes (upsert/remove)
     GET    /authz/users/{subject}/roles          a subject's roles
     POST   /authz/users/{subject}/roles          assign a role        {"role": "..."}
     DELETE /authz/users/{subject}/roles/{role}   revoke a role
@@ -141,15 +144,6 @@ class AvailableScopeItem(BaseModel):
 class ScopeItem(BaseModel):
     scope: str = Field(description="Scope string, e.g. 'agents:*:read'")
     effect: str = Field("allow", description="'allow' or 'deny'")
-
-
-class SetRoleScopesRequest(BaseModel):
-    scopes: List[Union[str, ScopeItem]] = Field(
-        ..., description="Permissions: strings (allow) or {scope, effect} objects"
-    )
-    name: Optional[str] = Field(None, description="Display name")
-    description: Optional[str] = Field(None, description="Role description")
-    is_default: Optional[bool] = Field(None, description="Mark as a default role")
 
 
 class CreateRoleRequest(BaseModel):
@@ -276,17 +270,6 @@ def get_roles_router(
 
     @router.get("/roles/{slug}", response_model=RoleSchema)
     def get_role(slug: str):
-        return RoleSchema.from_record(_role_or_404(slug))
-
-    @router.put("/roles/{slug}", response_model=RoleSchema)
-    def set_role(slug: str, body: SetRoleScopesRequest, actor: str = Depends(require_admin)):
-        scopes = [s if isinstance(s, str) else {"scope": s.scope, "effect": s.effect} for s in body.scopes]
-        try:
-            store.set_role_scopes(
-                slug, scopes, actor=actor, name=body.name, description=body.description, is_default=body.is_default
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
         return RoleSchema.from_record(_role_or_404(slug))
 
     @router.patch("/roles/{slug}", response_model=RoleSchema)

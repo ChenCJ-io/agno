@@ -102,9 +102,10 @@ def test_admin_can_list_and_read_roles(client_and_store):
 
 def test_admin_crud_role(client_and_store):
     client, store = client_and_store
-    # create a new role
+    # create a role (metadata only), then set its scopes via the subresource
+    assert client.post("/authz/roles", headers=_auth("alice"), json={"slug": "editor"}).status_code == 201
     r = client.put(
-        "/authz/roles/editor",
+        "/authz/roles/editor/scopes",
         headers=_auth("alice"),
         json={"scopes": ["agents:*:read", "agents:research-agent:run"]},
     )
@@ -137,8 +138,9 @@ def test_granting_via_api_takes_effect_on_next_request(client_and_store):
     ).status_code == 403
 
     # admin defines a runner role and grants it to bob via the HTTP API
+    assert client.post("/authz/roles", headers=_auth("alice"), json={"slug": "runner"}).status_code == 201
     assert client.put(
-        "/authz/roles/runner", headers=_auth("alice"), json={"scopes": ["agents:*:run"]}
+        "/authz/roles/runner/scopes", headers=_auth("alice"), json={"scopes": ["agents:*:run"]}
     ).status_code == 200
     assert client.post(
         "/authz/users/bob/roles", headers=_auth("alice"), json={"role": "runner"}
@@ -211,7 +213,7 @@ def test_admin_via_token_claim_can_manage():
 def test_patch_role_metadata_only(client_and_store):
     """PATCH /roles/{slug} updates name/description without touching scopes."""
     client, store = client_and_store
-    client.put("/authz/roles/editor", headers=_auth("alice"), json={"scopes": ["agents:*:read"], "name": "Editor"})
+    store.set_role_scopes("editor", ["agents:*:read"], name="Editor")
 
     r = client.patch("/authz/roles/editor", headers=_auth("alice"), json={"description": "can edit things"})
     assert r.status_code == 200, r.text
@@ -227,7 +229,7 @@ def test_patch_role_metadata_only(client_and_store):
 def test_put_scopes_subresource_replaces(client_and_store):
     """PUT /roles/{slug}/scopes replaces scopes, preserves metadata, returns scopes."""
     client, store = client_and_store
-    client.put("/authz/roles/editor", headers=_auth("alice"), json={"scopes": ["agents:*:read"], "name": "Editor"})
+    store.set_role_scopes("editor", ["agents:*:read"], name="Editor")
 
     r = client.put(
         "/authz/roles/editor/scopes",
@@ -246,11 +248,7 @@ def test_put_scopes_subresource_replaces(client_and_store):
 def test_patch_scopes_subresource_diffs(client_and_store):
     """PATCH /roles/{slug}/scopes adds/flips upsert and drops remove, keeping the rest."""
     client, store = client_and_store
-    client.put(
-        "/authz/roles/editor",
-        headers=_auth("alice"),
-        json={"scopes": ["agents:*:read", "teams:*:read"]},
-    )
+    store.set_role_scopes("editor", ["agents:*:read", "teams:*:read"])
 
     r = client.patch(
         "/authz/roles/editor/scopes",
