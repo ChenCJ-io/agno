@@ -1,14 +1,14 @@
-"""Optional Casbin-backed AuthorizationProvider.
+"""Optional Casbin-backed AuthorizationProvider (bring-your-own-enforcer).
 
-An advanced, embedded authorization provider for customers who need more than
-flat scopes: role hierarchies, ABAC conditions, and policy persisted/edited in
-their own DB. Casbin is a pure-Python library (no external service) and its DB
-adapter points at the customer's existing database, so this stays fully in the
-customer's infra.
+For advanced users who already have a configured ``casbin.Enforcer`` (their own
+model + DB adapter) and want to plug it straight into AgentOS. It's now a thin
+wrapper: the Casbin logic lives in
+:class:`~agno.os.authz.casbin_engine.CasbinPolicyEngine` (the swappable backend),
+and the generic :class:`~agno.os.authz.engine.EngineAuthorizationProvider` turns
+any engine into an :class:`AuthorizationProvider`.
 
-This is OPT-IN. Casbin is not a hard dependency of agno; install it with
-``pip install agno[casbin]`` (or ``pip install casbin``). The import is lazy so
-agno works without it. The default provider remains the zero-dependency
+OPT-IN. Casbin is not a hard dependency; install with ``pip install agno[roles]``.
+The default provider remains the zero-dependency
 :class:`~agno.os.authz.scope_provider.ScopeAuthorizationProvider`.
 
 Usage::
@@ -27,182 +27,30 @@ Usage::
         ),
     )
 
-Policy convention this provider assumes (Casbin ``p = sub, obj, act``):
-- ``sub`` is the principal (the JWT ``sub`` / ``principal_id``)
-- ``obj`` is ``"<resource_type>/<resource_id>"`` (e.g. ``agents/research-agent``),
-  or ``"<resource_type>"`` for collection-level checks. Use ``keyMatch2`` in the
-  model for wildcards like ``agents/*``.
-- ``act`` is the action (``read`` / ``run`` / ...).
-Role assignment uses Casbin grouping (``g, user, role``).
+Policy convention: ``sub`` = principal, ``obj`` = ``"<resource_type>/<resource_id>"``
+(or ``"<resource_type>"`` for collections; use ``keyMatch2`` for ``agents/*``),
+``act`` = action. Role assignment uses Casbin grouping (``g, user, role``).
 """
 
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, Optional
 
-from agno.os.authz.provider import AuthorizationContext, AuthorizationProvider
-
-
-def scope_to_obj_act(scope: str) -> Tuple[str, str]:
-    """Map an agno scope string to this provider's Casbin ``(obj, act)`` convention.
-
-    Single source of truth shared with :class:`ManagedRoleStore` so the policy a
-    role is *written* with and the request it is *checked* against use the same
-    spelling.
-
-    - ``agent_os:admin``             -> ("*", "*")
-    - ``sessions:write``             -> ("sessions/*", "write")   (collection/global)
-    - ``agents:research-agent:run``  -> ("agents/research-agent", "run")
-    - ``agents:*:run``               -> ("agents/*", "run")
-    """
-    if scope == "agent_os:admin":
-        return ("*", "*")
-    parts = scope.split(":")
-    if any(part == "" for part in parts):
-        raise ValueError(f"Unrecognised scope (empty component): {scope!r}")
-    if len(parts) == 2:
-        obj, act = f"{parts[0]}/*", parts[1]
-    elif len(parts) == 3:
-        obj, act = f"{parts[0]}/{parts[1]}", parts[2]
-    else:
-        raise ValueError(f"Unrecognised scope: {scope!r}")
-    # Reject an action wildcard. In Casbin's matcher ``*`` means "all actions",
-    # but the scope provider compares actions literally, so the SAME scope string
-    # (e.g. ``agents:*:*``) would grant everything here and nothing there. Refuse
-    # it so a managed role can't carry a silently-divergent broad grant; the one
-    # documented way to grant all actions is ``agent_os:admin``.
-    if act == "*":
-        raise ValueError(
-            f"Action wildcard '*' is not allowed in scope {scope!r}: it would mean 'all actions' "
-            f"under Casbin but nothing under the scope provider. List explicit actions "
-            f"(read/run/write/delete), use a resource-id wildcard like 'agents:*:run', or grant "
-            f"'agent_os:admin'."
-        )
-    return (obj, act)
+# Re-exported for back-compat: scope_to_obj_act now lives with the Casbin engine.
+from agno.os.authz.casbin_engine import CasbinPolicyEngine, scope_to_obj_act  # noqa: F401
+from agno.os.authz.engine import EngineAuthorizationProvider
 
 
-class CasbinAuthorizationProvider(AuthorizationProvider):
-    """Authorization decisions delegated to a Casbin enforcer."""
+class CasbinAuthorizationProvider(EngineAuthorizationProvider):
+    """Authorization decisions delegated to a Casbin enforcer you supply."""
 
     def __init__(self, enforcer: Any, roles_claim: Optional[str] = None):
         """
         Args:
-            enforcer: a configured ``casbin.Enforcer`` (sync). The caller owns
-                the model + adapter (file, string, or a DB adapter pointed at
-                their own database), so policy storage stays in their infra.
-            roles_claim: optional JWT claim name carrying the caller's roles
-                (e.g. ``"roles"`` for an Auth0/WorkOS token). When set and the
-                claim is present, the caller's roles come FROM the token and we
-                authorize each against the policy (handles "users with an IdP").
-                When None or absent, roles come from Casbin's own ``g``
-                assignments keyed on the subject (handles "users without an
-                IdP"). Both populations are served by the same provider.
+            enforcer: a configured ``casbin.Enforcer`` (sync). You own the model +
+                adapter, so policy storage stays in your infra.
+            roles_claim: optional JWT claim carrying the caller's roles (e.g.
+                ``"roles"`` for Auth0/WorkOS). When set and present, roles come FROM
+                the token and each is authorized against the policy (the IdP case);
+                otherwise roles come from the enforcer's ``g`` assignments keyed on
+                the subject (the no-IdP case).
         """
-        # Lazy validation: don't import casbin at module load, but fail clearly
-        # if someone passes something that isn't an enforcer.
-        if not hasattr(enforcer, "enforce"):
-            raise TypeError(
-                "CasbinAuthorizationProvider requires a casbin.Enforcer "
-                "(install with `pip install agno[casbin]`). Got: "
-                f"{type(enforcer)!r}"
-            )
-        self._enforcer = enforcer
-        self._roles_claim = roles_claim
-
-    def _obj(self, ctx: AuthorizationContext) -> Optional[str]:
-        if not ctx.resource_type:
-            return None
-        return f"{ctx.resource_type}/{ctx.resource_id}" if ctx.resource_id else ctx.resource_type
-
-    def _enforce(self, ctx: AuthorizationContext, obj: str, act: str) -> bool:
-        """Run one Casbin decision for ``(obj, act)`` against ``ctx``'s identity.
-
-        Roles-from-token (IdP case): if the token carries roles, authorize each
-        role against the policy (a role matches its own policies in Casbin's
-        RBAC), so we don't need stored ``g`` assignments for this user.
-        Roles-from-store (no-IdP case): authorize the subject; Casbin resolves
-        the subject's roles from its own ``g`` assignments.
-        """
-        if self._roles_claim:
-            roles = ctx.claims.get(self._roles_claim)
-            if isinstance(roles, str):  # e.g. WorkOS sends a single "role" string
-                roles = [roles]
-            if isinstance(roles, list) and roles:
-                return any(bool(self._enforcer.enforce(role, obj, act)) for role in roles)
-        if not ctx.principal_id:
-            return False
-        return bool(self._enforcer.enforce(ctx.principal_id, obj, act))
-
-    def check(self, ctx: AuthorizationContext) -> bool:
-        # Non-resource checks can't be expressed as (sub,obj,act); defer (allow)
-        # and let the route gate (authorize_route) handle them via the route's
-        # required scopes.
-        obj = self._obj(ctx)
-        if obj is None or not ctx.action:
-            return True
-        return self._enforce(ctx, obj, ctx.action)
-
-    def authorize_route(self, ctx: AuthorizationContext, required_scopes: List[str]) -> bool:
-        """Route-level gate run by the middleware before the handler.
-
-        For resource-typed routes (agents/teams/workflows) the middleware has
-        already extracted ``(resource_type, resource_id, action)``, so decide on
-        that via :meth:`check`. For every other route (sessions, memory, config,
-        knowledge, ...) the middleware can't tag a resource type — so we evaluate
-        the route's ``required_scopes`` directly against the policy. Without this,
-        those routes would be ungated under this provider (any authenticated
-        caller would pass), unlike the default scope provider which enforces them.
-        Allow if ANY required scope is satisfied (``agent_os:admin`` satisfies all).
-        """
-        if ctx.resource_type:
-            return self.check(ctx)
-        if not required_scopes:
-            return True
-        for scope in required_scopes:
-            try:
-                obj, act = scope_to_obj_act(scope)
-            except ValueError:
-                continue
-            if self._enforce(ctx, obj, act):
-                return True
-        return False
-
-    def accessible_resource_ids(self, ctx: AuthorizationContext) -> Set[str]:
-        """Best-effort list-filtering support, derived from the principal's
-        implicit permissions (direct + via roles). Returns ``{"*"}`` for
-        wildcard/collection grants, otherwise the set of specific ids.
-        """
-        if not ctx.resource_type or not ctx.principal_id:
-            return set()
-
-        rt = ctx.resource_type
-        action = ctx.action
-        try:
-            perms = self._enforcer.get_implicit_permissions_for_user(ctx.principal_id)
-        except Exception:
-            # Some models/adapters don't support implicit perms; fall back to
-            # explicit policy for the user.
-            perms = [p for p in self._enforcer.get_policy() if p and p[0] == ctx.principal_id]
-
-        ids: Set[str] = set()
-        for perm in perms:
-            # perm is [sub, obj, act, ...]. A row missing obj or act is malformed;
-            # skip it. Crucially we do NOT treat a missing/None act as "matches any
-            # action" — that was a fail-open that let a malformed policy row grant
-            # ids for actions it never authorised.
-            if len(perm) < 3:
-                continue
-            p_obj, p_act = perm[1], perm[2]
-            if p_obj is None or p_act is None:
-                continue
-            # Skip explicit deny rows — a denied scope is not "accessible".
-            if len(perm) >= 4 and str(perm[3]).lower() == "deny":
-                continue
-            # When a concrete action is requested, only count grants for that exact
-            # action or a true Casbin action-wildcard ("*").
-            if action is not None and p_act != action and p_act != "*":
-                continue
-            if p_obj in ("*", f"{rt}/*", rt):
-                return {"*"}
-            prefix = f"{rt}/"
-            if p_obj.startswith(prefix):
-                ids.add(p_obj[len(prefix):])
-        return ids
+        super().__init__(CasbinPolicyEngine(enforcer=enforcer), roles_claim=roles_claim)

@@ -34,26 +34,10 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from agno.os.authz._db import engine_from_db as _engine_from_db
-from agno.os.authz.casbin_provider import scope_to_obj_act
+from agno.os.authz.engine import EngineAuthorizationProvider, PolicyEngine
 
 if TYPE_CHECKING:
     from agno.os.authz.audit import AuditSink
-
-# Policies carry an effect (``eft``) so a role can explicitly DENY a scope, not
-# just grant it. Deny overrides allow (``some(allow) && !some(deny)``), matching
-# the cloud RBAC semantics where a scope's ``value`` is allow|deny.
-_MODEL_TEXT = """
-[request_definition]
-r = sub, obj, act
-[policy_definition]
-p = sub, obj, act, eft
-[role_definition]
-g = _, _
-[policy_effect]
-e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
-[matchers]
-m = g(r.sub, p.sub) && (p.obj == "*" || keyMatch2(r.obj, p.obj)) && (p.act == "*" || r.act == p.act)
-"""
 
 # A scope plus its effect. Inputs accept a bare string (= allow), a (scope, effect)
 # tuple, or a {"scope": ..., "effect"|"value": ...} dict.
@@ -77,23 +61,10 @@ def _normalize_scope(entry: ScopeInput) -> Tuple[str, str]:
     return scope, effect
 
 
-def _obj_act_to_scope(obj: str, act: str) -> str:
-    """Best-effort reverse of :func:`scope_to_obj_act`, for display/read-back.
-
-    Lossy where two scope spellings collapse to the same policy (``agents:read``
-    and ``agents:*:read`` both store as ``("agents/*", "read")``); we render the
-    global ``resource:action`` form in that case.
-    """
-    if obj == "*":
-        return "agent_os:admin"
-    if obj.endswith("/*"):
-        return f"{obj[:-2]}:{act}"
-    resource, _, rid = obj.partition("/")
-    return f"{resource}:{rid}:{act}"
-
-
 class ManagedRoleStore:
-    """Runtime-mutable, persisted role store. agno-native in, Casbin hidden."""
+    """Runtime-mutable, persisted role store. agno-native API; the policy engine
+    (Casbin by default) is a swappable backend behind the :class:`PolicyEngine`
+    port — pass ``engine=`` to use a different one."""
 
     def __init__(
         self,
@@ -102,13 +73,14 @@ class ManagedRoleStore:
         audit: Optional["AuditSink"] = None,
         decision_log: bool = False,
         db: Optional[Any] = None,
+        engine: Optional[PolicyEngine] = None,
     ):
         """
         Args:
             db_url: SQLAlchemy URL for the DB that holds the policy (e.g.
                 ``postgresql+psycopg://...`` or ``sqlite:///roles.db``). Use your
-                own database. If omitted (and no ``db``), the store is in-memory
-                (not persisted) — fine for tests, not for production.
+                own database. If omitted (and no ``db``/``engine``), the store is
+                in-memory (not persisted) — fine for tests, not for production.
             roles_claim: JWT claim carrying a caller's roles (the external-IdP
                 case). When absent, roles come from this store's own assignments
                 (the no-IdP case). Both are served by the same store.
@@ -124,27 +96,17 @@ class ManagedRoleStore:
                 so roles live in the same database as your agent data with one
                 connection pool — no second ``db_url`` to keep in sync. Takes
                 precedence over ``db_url``.
+            engine: a custom :class:`~agno.os.authz.engine.PolicyEngine` backend.
+                Defaults to the Casbin engine built from ``db``/``db_url``. Supply
+                your own to swap the backend (OpenFGA/SpiceDB/SQL) without changing
+                anything else.
         """
-        try:
-            import casbin  # noqa: F401
-        except ImportError as e:  # pragma: no cover
-            raise ImportError(
-                "ManagedRoleStore needs the optional managed-roles extra. "
-                'Install it with: pip install "agno[roles]"'
-            ) from e
-
-        import casbin
-
-        model = casbin.Model()
-        model.load_model_from_text(_MODEL_TEXT)
-        adapter_target = _engine_from_db(db) if db is not None else db_url
-        if adapter_target is not None:
-            from casbin_sqlalchemy_adapter import Adapter
-
-            self._enforcer = casbin.Enforcer(model, Adapter(adapter_target))
+        if engine is not None:
+            self._engine: PolicyEngine = engine
         else:
-            self._enforcer = casbin.Enforcer(model)
-        self._enforcer.enable_auto_save(True)  # mutations persist immediately
+            from agno.os.authz.casbin_engine import CasbinPolicyEngine
+
+            self._engine = CasbinPolicyEngine(db_url=db_url, db=db)
         self._roles_claim = roles_claim
         self._audit = audit
 
@@ -298,27 +260,17 @@ class ManagedRoleStore:
         / updates the role's metadata (display ``name`` / ``description`` /
         ``is_default``)."""
         before = self.get_role_scopes(role) if self._audit else None
-        self._enforcer.remove_filtered_policy(0, role)
-        for entry in scopes:
-            scope, effect = _normalize_scope(entry)
-            obj, act = scope_to_obj_act(scope)
-            self._enforcer.add_policy(role, obj, act, effect)
+        self._engine.set_role_scopes(role, [_normalize_scope(e) for e in scopes])
         self._meta_upsert(role, name=name, description=description, is_default=is_default)
         self._emit("role.set_scopes", role, before, self.get_role_scopes(role) if self._audit else None, actor)
 
     def get_role_scopes(self, role: str) -> List[str]:
         """Return a role's scope strings (allow + deny), for display/read-back."""
-        return sorted(
-            _obj_act_to_scope(p[1], p[2]) for p in self._enforcer.get_filtered_policy(0, role) if len(p) >= 3
-        )
+        return sorted(scope for scope, _ in self._engine.get_role_scopes(role))
 
     def get_role_scope_entries(self, role: str) -> List[dict]:
         """Return a role's scopes with effects: ``[{"scope": ..., "effect": ...}]``."""
-        entries = []
-        for p in self._enforcer.get_filtered_policy(0, role):
-            if len(p) >= 3:
-                effect = p[3] if len(p) >= 4 else "allow"
-                entries.append({"scope": _obj_act_to_scope(p[1], p[2]), "effect": effect})
+        entries = [{"scope": scope, "effect": effect} for scope, effect in self._engine.get_role_scopes(role)]
         return sorted(entries, key=lambda e: (e["scope"], e["effect"]))
 
     def create_role(
@@ -366,13 +318,10 @@ class ManagedRoleStore:
         before = self.get_role_scopes(role) if self._audit else None
         for entry in upsert or []:
             scope, effect = _normalize_scope(entry)
-            obj, act = scope_to_obj_act(scope)
-            self._enforcer.remove_filtered_policy(0, role, obj, act)  # drop any prior effect
-            self._enforcer.add_policy(role, obj, act, effect)
+            self._engine.add_scope(role, scope, effect)
         for entry in remove or []:
             scope, _ = _normalize_scope(entry)
-            obj, act = scope_to_obj_act(scope)
-            self._enforcer.remove_filtered_policy(0, role, obj, act)
+            self._engine.remove_scope(role, scope)
         self._meta_upsert(role)  # touch updated_at / ensure metadata row exists
         self._emit("role.set_scopes", role, before, self.get_role_scopes(role) if self._audit else None, actor)
 
@@ -396,14 +345,13 @@ class ManagedRoleStore:
 
     def remove_role(self, role: str, actor: Optional[str] = None) -> None:
         before = self.get_role_scopes(role) if self._audit else None
-        self._enforcer.remove_filtered_policy(0, role)
-        self._enforcer.remove_filtered_grouping_policy(1, role)
+        self._engine.remove_role(role)
         self._meta_delete(role)
         self._emit("role.removed", role, before, None, actor)
 
     def list_roles(self) -> List[str]:
         """All role slugs (those with policies and/or metadata)."""
-        slugs = {p[0] for p in self._enforcer.get_policy()}
+        slugs = set(self._engine.list_roles())
         if self._meta_mem is not None:
             slugs |= set(self._meta_mem.keys())
         elif self._meta_engine is not None:
@@ -421,16 +369,16 @@ class ManagedRoleStore:
     def assign(self, subject: str, role: str, actor: Optional[str] = None) -> None:
         """Give a subject a role (runtime, persisted)."""
         before = self.roles_of(subject) if self._audit else None
-        self._enforcer.add_role_for_user(subject, role)
+        self._engine.assign(subject, role)
         self._emit("user.assigned", subject, before, self.roles_of(subject) if self._audit else None, actor)
 
     def unassign(self, subject: str, role: str, actor: Optional[str] = None) -> None:
         before = self.roles_of(subject) if self._audit else None
-        self._enforcer.delete_role_for_user(subject, role)
+        self._engine.unassign(subject, role)
         self._emit("user.unassigned", subject, before, self.roles_of(subject) if self._audit else None, actor)
 
     def roles_of(self, subject: str) -> List[str]:
-        return list(self._enforcer.get_roles_for_user(subject))
+        return self._engine.roles_of(subject)
 
     # ------------------------------------------------------------------ audit
     def audit_log(self, limit: int = 100) -> List[Dict[str, Any]]:
@@ -446,29 +394,23 @@ class ManagedRoleStore:
     def can_manage(self, principal_id: Optional[str], claims: Optional[Dict[str, Any]] = None) -> bool:
         """True if the caller may administer roles (i.e. satisfies ``agent_os:admin``).
 
-        Only full admins manage the role store. An admin can be defined two ways,
-        both handled here:
-          - by a role in this store (``enforce(sub, "*", "*")``), or
+        Admin can be defined two ways, both handled via the engine:
+          - by a role in this store (subject -> agent_os:admin), or
           - by a role carried on the token, when ``roles_claim`` is set.
-        Note this is intentionally NOT the generic provider ``check`` (which
-        defers non-resource decisions to route scope mappings and would let any
-        authenticated caller through).
+        Intentionally NOT the generic provider ``check`` (which defers non-resource
+        decisions and would let any authenticated caller through).
         """
+        roles: Optional[List[str]] = None
         if self._roles_claim and claims:
-            roles = claims.get(self._roles_claim)
-            if isinstance(roles, str):  # e.g. WorkOS sends a single "role" string
-                roles = [roles]
-            if isinstance(roles, list):
-                if any(bool(self._enforcer.enforce(r, "*", "*")) for r in roles):
-                    return True
-        if principal_id:
-            return bool(self._enforcer.enforce(principal_id, "*", "*"))
-        return False
+            raw = claims.get(self._roles_claim)
+            if isinstance(raw, str):  # WorkOS sends a single "role" string
+                raw = [raw]
+            if isinstance(raw, list) and raw:
+                roles = raw
+        return self._engine.check_scope("agent_os:admin", subject=principal_id, roles=roles)
 
     # --------------------------------------------------------------- provider
     @property
     def provider(self):
-        """The AuthorizationProvider to plug into AuthorizationConfig."""
-        from agno.os.authz.casbin_provider import CasbinAuthorizationProvider
-
-        return CasbinAuthorizationProvider(self._enforcer, roles_claim=self._roles_claim)
+        """The AuthorizationProvider to plug into AuthorizationConfig (engine-backed)."""
+        return EngineAuthorizationProvider(self._engine, roles_claim=self._roles_claim)
